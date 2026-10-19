@@ -51,7 +51,7 @@ def dist_m(a, b):
     # East-west gap: degrees of longitude shrink toward the poles,
     # so scale by cos(latitude), using the midpoint latitude (converted to radians)
     dx = (b[1] - a[1]) * M_PER_DEG * math.cos(math.radians((a[0] + b[0]) / 2))
-    # Treat the small area as flat and apply Pythagoras: sqrt(dx� + dy�)
+    # Treat the small area as flat and apply Pythagoras: sqrt(dx**2 + dy**2)
     return math.hypot(dx, dy)
 
 
@@ -122,9 +122,11 @@ def parse_sel(text, n):
     return out
 
 
-def checklist(title, header, lines):
+def checklist(title, header, lines):  # noqa: C901
     # Full-screen checkbox list (curses). Returns the set of checked 1-based positions.
     # Keys: up/down or k/j move, space toggles, a = all, n = none, enter confirms, q aborts.
+    # The C901 exemption is deliberate: a flat key-dispatch loop is many trivial branches,
+    # not hard logic, and splitting it would scatter one small curses screen across functions.
     def run(scr):
         curses.curs_set(0)                          # hide the text cursor
         checked = [False] * len(lines)
@@ -234,10 +236,7 @@ def show(table):
     print()
 
 
-def curate(group, a):
-    # Curate one group of datasets (the whole batch, or one file with --per-file):
-    # rank devices, ask what to scrub/filter, then back up and rewrite each file.
-
+def pool_devices(group):
     # Pool every row in the group: sighting count, positions, and SSIDs per MAC
     pts, ssids, counts = defaultdict(list), defaultdict(Counter), Counter()
     for d in group:
@@ -247,47 +246,53 @@ def curate(group, a):
             pts[r[iM]].append(p)
             if iS is not None:
                 ssids[r[iM]][r[iS]] += 1
+    return pts, ssids, counts
 
-    # Name a single file, otherwise just count them (hundreds of names would clutter the output)
-    label = group[0]["path"].name if len(group) == 1 else f"{len(group)} files"
-    print(f"\n== {label}")
-    print(f"{sum(d['nrows'] for d in group)} rows, {len(counts)} unique devices, "
-          f"{sum(d['no_gps'] for d in group)} rows with no GPS (will be dropped)")
 
+def rank_devices(pts, ssids, counts, top):
     # Top-N most-seen devices as (mac, ssid, count, spread) tuples
     table = []
-    for mac, cnt in counts.most_common(a.top):
+    for mac, cnt in counts.most_common(top):
         p = sorted(pts[mac])
         med = p[len(p) // 2]                            # median position
         dd = sorted(dist_m(med, q) for q in p)
-        spread = dd[int(0.9 * (len(dd) - 1))]  # p90, ignores GPS outliers
+        spread = dd[int(0.9 * (len(dd) - 1))]           # p90, ignores GPS outliers
         ssid = ssids[mac].most_common(1)[0][0] if ssids[mac] else ""
         table.append((mac, ssid or "<hidden>", cnt, spread))
-    if not table:
-        print("No usable rows; nothing to do.")
-        return
+    return table
 
-    # Question 1: devices that mark a place to scrub (home, work...)
-    scrub = ask(f"[1/2] SCRUB: check networks near a place to remove (all data within {a.radius:.0f} m)", table)
+
+def ask_scrub(table, radius):
+    # Question 1: devices that mark a place to scrub (home, work...).
+    # Returns the 1-based table numbers the user checked.
+    scrub = ask(f"[1/2] SCRUB: check networks near a place to remove (all data within {radius:.0f} m)", table)
 
     # A device that moves more than the radius would carve out its whole route; confirm first
-    wide = [table[i - 1] for i in scrub if table[i - 1][3] > a.radius]
+    wide = sorted(i for i in scrub if table[i - 1][3] > radius)
     if wide:
         print("\n  Warning: these move more than the radius; scrubbing carves out their whole track:")
-        for mac, ssid, _, sp in wide:
-            print(f"    {mac}  {ssid}  ({sp:.0f} m spread)")
+        for i in wide:
+            mac, ssid, _, spread = table[i - 1]
+            print(f"    {mac}  {ssid}  ({spread:.0f} m spread)")
         if input("  Scrub them anyway? [y/N] ").strip().lower() != "y":
-            scrub -= {i for i in scrub if table[i - 1][3] > a.radius}
+            scrub -= set(wide)
             print("  Dropped them from the scrub list; you can filter them in the next step.")
+    return scrub
 
-    # Question 2: of the rest, devices to drop on their own (travel routers etc.)
-    rest = [(i, t) for i, t in enumerate(table, 1) if i not in scrub]
-    filt = set()
-    if rest:
-        pick = ask("[2/2] FILTER: check networks to drop (only that device's own rows)",
-                   [t for _, t in rest])
-        filt = {rest[i - 1][1][0] for i in pick}        # positions in rest -> MACs
-    scrub_macs = {table[i - 1][0] for i in scrub}
+
+def ask_filter(table, scrub):
+    # Question 2: of the networks not already scrubbed, devices to drop on their own
+    # (travel routers etc.). Returns a set of MACs.
+    rest = [t for i, t in enumerate(table, 1) if i not in scrub]
+    if not rest:
+        return set()
+    pick = ask("[2/2] FILTER: check networks to drop (only that device's own rows)", rest)
+    return {rest[i - 1][0] for i in pick}               # positions in rest -> MACs
+
+
+def build_scrub_zone(scrub_macs, pts, group, radius):
+    # Returns near_anchor(p): True if point p is within `radius` meters of anywhere
+    # a scrub device was seen.
 
     # Anchors: where scrub devices were seen, deduped on a ~25 m grid.
     g = 25 / M_PER_DEG
@@ -295,56 +300,90 @@ def curate(group, a):
                for m in scrub_macs for la, lo in pts[m]}.values()
     # Bucket anchors into cells at least one radius wide, so a point only has to be
     # compared against anchors in its own and the 8 neighboring cells
-    cell_lat = a.radius * 1.01 / M_PER_DEG
+    cell_lat = radius * 1.01 / M_PER_DEG
     max_lat = max((abs(p[0]) for d in group for _, p in d["valid"]), default=0)
-    cell_lon = a.radius * 1.01 / (M_PER_DEG * max(math.cos(math.radians(min(max_lat, 89))), 0.01))
+    cell_lon = radius * 1.01 / (M_PER_DEG * max(math.cos(math.radians(min(max_lat, 89))), 0.01))
     grid = defaultdict(list)
     for pt in anchors:
         grid[(math.floor(pt[0] / cell_lat), math.floor(pt[1] / cell_lon))].append(pt)
 
     def near_anchor(p):
-        # True if point p is within the radius of any anchor
+        if not grid:                                    # nothing was checked for scrubbing
+            return False
         cy, cx = math.floor(p[0] / cell_lat), math.floor(p[1] / cell_lon)
-        return any(dist_m(p, q) <= a.radius
+        return any(dist_m(p, q) <= radius
                    for dy in (-1, 0, 1) for dx in (-1, 0, 1)
                    for q in grid.get((cy + dy, cx + dx), ()))
 
-    # Apply to each file: drop filtered/scrub devices and anything near an anchor,
+    return near_anchor
+
+
+def split_rows(d, filt, scrub_macs, near_anchor):
+    # Sort one file's rows into kept vs dropped.
+    # Returns (kept rows, number scrubbed, number filtered).
+    iM = d["ix"]["MAC"]
+    kept, n_scrub, n_filt = [], 0, 0
+    for r, p in d["valid"]:
+        # Matching is by BSSID (the MAC column) only. SSID appears in the table but is never
+        # compared. Checked MACs are dropped by exact string match, so sibling BSSIDs of one
+        # network (dual-band, mesh, travel routers) must each be checked on their own.
+        # SCRUB also drops any row, from any device, within the radius of where the
+        # checked devices were seen.
+        if r[iM] in filt or r[iM] in scrub_macs:        # the chosen devices themselves
+            n_filt += r[iM] in filt
+            n_scrub += r[iM] in scrub_macs
+        elif near_anchor(p):                            # any other device near a scrub spot
+            n_scrub += 1
+        else:
+            kept.append(r)
+    return kept, n_scrub, n_filt
+
+
+def write_cleaned(d, kept):
+    # Back up the original, then replace it with the cleaned rows
+    shutil.copy2(d["path"], d["bak"])  # original preserved before anything is touched
+    # Write to a temp file in the same folder, then replace atomically
+    fd, tmp = tempfile.mkstemp(dir=d["path"].parent, suffix=".tmp")
+    with os.fdopen(fd, "w", newline="", encoding="utf-8") as f:
+        if d["preamble"]:
+            f.write(d["preamble"])
+        w = csv.writer(f)
+        w.writerow(d["cols"])
+        w.writerows(kept)
+    os.replace(tmp, d["path"])
+
+
+def curate(group, a):
+    # Curate one group of datasets (the whole batch, or one file with --per-file):
+    # rank devices, ask what to scrub/filter, then back up and rewrite each file.
+    pts, ssids, counts = pool_devices(group)
+
+    # Name a single file, otherwise just count them (hundreds of names would clutter the output)
+    label = group[0]["path"].name if len(group) == 1 else f"{len(group)} files"
+    print(f"\n== {label}")
+    print(f"{sum(d['nrows'] for d in group)} rows, {len(counts)} unique devices, "
+          f"{sum(d['no_gps'] for d in group)} rows with no GPS (will be dropped)")
+
+    table = rank_devices(pts, ssids, counts, a.top)
+    if not table:
+        print("No usable rows; nothing to do.")
+        return
+
+    scrub = ask_scrub(table, a.radius)
+    filt = ask_filter(table, scrub)
+    scrub_macs = {table[i - 1][0] for i in scrub}
+    near_anchor = build_scrub_zone(scrub_macs, pts, group, a.radius)
+
+    # Apply to each file: drop filtered/scrub devices and anything near a scrub spot,
     # then back up the original and swap the cleaned file in. Prints one summary
     # line for the whole group instead of one line per file.
     print()
+    action = "dry-run" if a.dry_run else "done"
     totals = Counter()
     for d in group:
-        iM = d["ix"]["MAC"]
-        kept, n_scrub, n_filt = [], 0, 0
-        for r, p in d["valid"]:
-            # Matching is by BSSID (the MAC column) only. SSID appears in the table but is never
-            # compared. Checked MACs are dropped by exact string match, so sibling BSSIDs of one
-            # network (dual-band, mesh, travel routers) must each be checked on their own.
-            # SCRUB also drops any row, from any device, within the radius of where the
-            # checked devices were seen.
-            if r[iM] in filt or r[iM] in scrub_macs:    # the chosen devices themselves
-                n_filt += r[iM] in filt
-                n_scrub += r[iM] in scrub_macs
-            elif grid and near_anchor(p):               # any other device near a scrub spot
-                n_scrub += 1
-            else:
-                kept.append(r)
-
-        if a.dry_run:
-            action = "dry-run"
-        else:
-            shutil.copy2(d["path"], d["bak"])  # original preserved before anything is touched
-            # Write to a temp file in the same folder, then replace atomically
-            fd, tmp = tempfile.mkstemp(dir=d["path"].parent, suffix=".tmp")
-            with os.fdopen(fd, "w", newline="", encoding="utf-8") as f:
-                if d["preamble"]:
-                    f.write(d["preamble"])
-                w = csv.writer(f)
-                w.writerow(d["cols"])
-                w.writerows(kept)
-            os.replace(tmp, d["path"])
-            action = "done"
+        kept, n_scrub, n_filt = split_rows(d, filt, scrub_macs, near_anchor)
+        if not a.dry_run:
+            write_cleaned(d, kept)
         totals.update(kept=len(kept), scrubbed=n_scrub, filtered=n_filt, no_gps=d["no_gps"])
     print(f"  {action:<7} {label}: kept {totals['kept']} | scrubbed {totals['scrubbed']} "
           f"| filtered {totals['filtered']} | no-gps {totals['no_gps']}")
