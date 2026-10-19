@@ -1,0 +1,25 @@
+# .github/workflows/bandit.yml
+
+# Built from the following examples:
+# - https://www.shellcheck.net/wiki/GitHub-Actions
+# - https://github.com/geerlingguy/ansible-role-docker/blob/master/.github/workflows/ci.yml
+
+name: bandit
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+jobs:
+  flake8:
+    name: bandit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v6
+      #  with:
+      #    python-version: '3.13'
+      - name: Run bandit
+        run: |
+          python3 -m pip install bandit
+          bandit -r .
