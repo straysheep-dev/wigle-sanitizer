@@ -10,10 +10,13 @@ on:
     branches: ["main"]
   pull_request:
     branches: ["main"]
+permissions: {}
 jobs:
-  flake8:
+  bandit:
     name: bandit
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v6
