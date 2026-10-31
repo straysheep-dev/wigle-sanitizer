@@ -1,2 +1,5 @@
 *.bak
+*.csv
+*.tmp
 ignore.txt
+!test/sample.csv
