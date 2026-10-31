@@ -555,11 +555,17 @@ def merge_parts(parts, known):
     return rows, hits
 
 
-def report_ignored(hits, known, out):
+def report_ignored(hits, known, out, n_rows):
     # Final check on what is about to be uploaded: say which ignore-list devices still have
-    # rows in the combined file, and in which files. Returns the number of flagged rows.
+    # rows in the combined file, and in which files. Always prints the outcome, so a clean
+    # result is confirmed, not just silent. Returns the number of flagged rows.
     total = sum(sum(per_file.values()) for per_file in hits.values())
+    if not known:
+        print("  ignore check: the ignore list is empty or missing; nothing to check against")
+        return 0
     if not total:
+        print(f"  ignore check: 0 hits ({len(known)} ignore-list {'entry' if len(known) == 1 else 'entries'} "
+              f"checked against {n_rows} rows)")
         return 0
     print(f"\n  WARNING: {total} row(s) in {out.name} are from devices on your ignore list:")
     for mac, per_file in sorted(hits.items()):
@@ -590,7 +596,7 @@ def combine_sanitized(found, out, known, dry_run):
         write_csv(out, parts[0][1], parts[0][2], rows)
     print(f"  combined: {'would write' if dry_run else 'wrote'} {len(rows)} rows "
           f"from {len(parts)} file(s) to {out}")
-    return report_ignored(hits, known, out)
+    return report_ignored(hits, known, out, len(rows))
 
 
 def load_ignore(path):
