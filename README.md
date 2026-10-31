@@ -4,6 +4,8 @@
 
 Prepare WiGLE CSVs for upload. Standard library only; the only state is the optional [ignore list](#ignore-list).
 
+![](./demo.png)
+
 Point it at a file or a directory; all CSVs found are pooled, every network is listed (most-seen first) and you choose what to filter out, in two ways:
 
 1. **Filter by zone**: drop every row within R meters of each network selected here (home, work...), from any device
